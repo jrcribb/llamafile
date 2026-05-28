@@ -223,7 +223,9 @@ LLAMAFILE_OBJS := \
 LLAMAFILE_HIGHLIGHT_GPERF_FILES := $(wildcard llamafile/highlight/*.gperf)
 LLAMAFILE_HIGHLIGHT_KEYWORDS := $(LLAMAFILE_HIGHLIGHT_GPERF_FILES:%.gperf=o/$(MODE)/%.o)
 
-# Server objects for llamafile
+# Server objects for llamafile. server-http.cpp references
+# llama_ui_find_asset, which lives in the generated ui.cpp produced by
+# llama.cpp/BUILD.mk's web UI block (see UI_GEN_OBJ).
 LLAMAFILE_SERVER_SUPPORT_OBJS := \
 	o/$(MODE)/llama.cpp/tools/server/server-chat.cpp.o \
 	o/$(MODE)/llama.cpp/tools/server/server-common.cpp.o \
@@ -232,7 +234,8 @@ LLAMAFILE_SERVER_SUPPORT_OBJS := \
 	o/$(MODE)/llama.cpp/tools/server/server-models.cpp.o \
 	o/$(MODE)/llama.cpp/tools/server/server-queue.cpp.o \
 	o/$(MODE)/llama.cpp/tools/server/server-task.cpp.o \
-	o/$(MODE)/llama.cpp/tools/server/server-tools.cpp.o
+	o/$(MODE)/llama.cpp/tools/server/server-tools.cpp.o \
+	$(UI_GEN_OBJ)
 
 # Metal source files to embed in the executable (for runtime compilation on macOS)
 # These are extracted at runtime and compiled into ggml-metal.dylib
@@ -293,7 +296,7 @@ LLAMAFILE_SERVER_INCS := \
 	-iquote o/$(MODE)/llama.cpp/tools/server
 
 # Compile server.cpp
-o/$(MODE)/llamafile/server.cpp.o: llama.cpp/tools/server/server.cpp $(SERVER_ASSETS)
+o/$(MODE)/llamafile/server.cpp.o: llama.cpp/tools/server/server.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(LLAMAFILE_CPPFLAGS) $(LLAMAFILE_SERVER_INCS) -DLLAMA_BUILD_WEBUI -c -o $@ $<
 
@@ -310,8 +313,7 @@ o/$(MODE)/llamafile/llamafile: \
 		o/$(MODE)/llamafile/main.o \
 		o/$(MODE)/llamafile/server.cpp.o \
 		$(LLAMAFILE_OBJS) \
-		$(LLAMAFILE_DEPS) \
-		$(SERVER_ASSETS)
+		$(LLAMAFILE_DEPS)
 	@mkdir -p $(@D)
 	$(CXX) $(LDFLAGS) -o $@ $(filter %.o,$^) $(LDLIBS)
 

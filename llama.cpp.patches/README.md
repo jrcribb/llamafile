@@ -52,6 +52,7 @@ The `GGML_CALL` macro (defined as `__attribute__((__ms_abi__))` when `GGML_MULTI
 | `ggml_src_ggml-cuda_ggml-cuda.cu.patch` | Adds `GGML_CALL` to all CUDA backend callback implementations (60+ functions); also adds `free_struct` and TinyBLAS BF16 guard (see below) |
 | `ggml_src_ggml-metal_ggml-metal.cpp.patch` | Adds `GGML_CALL` to all Metal backend callback implementations (62 functions); also adds `free_struct` (see below) |
 | `ggml_src_ggml-vulkan_ggml-vulkan.cpp.patch` | Adds `GGML_CALL` to all Vulkan backend callback implementations; also adds `free_struct` and a heap memory underflow fix (see below) |
+| `ggml_src_ggml-backend-meta.cpp.patch` | Adds `GGML_CALL` to all meta-device, meta-buffer-type, meta-buffer, and meta-backend callback implementations (the meta backend aggregates several simple backends behind one interface, so its callbacks are reached through the same function-pointer structs) |
 
 ### Cross-Module Memory Management
 
@@ -97,6 +98,28 @@ Llamafile uses TinyBLAS as a lightweight replacement for cuBLAS, enabling GPU su
 | `ggml_src_ggml-cuda_common.cuh.patch` | Disables BF16 MMA when using TinyBLAS (TinyBLAS would incorrectly interpret BF16 as FP16) |
 | `ggml_src_ggml-cuda_ggml-cuda.cu.patch` | Disables BF16 in `ggml_cuda_op_mul_mat_cublas` when using TinyBLAS |
 
+### Optional IQ-Quant Exclusion (CUDA)
+
+The IQ ("importance") quantization formats (`IQ1_S`, `IQ2_XXS`/`XS`/`S`, `IQ3_S`/`XXS`, `IQ4_NL`/`XS`) pull in a large amount of CUDA template instantiation that inflates compile time and binary size. These patches gate every IQ code path behind `#ifndef GGML_CUDA_NO_IQ_QUANTS`, so a build can compile them out by defining `GGML_CUDA_NO_IQ_QUANTS`. When the macro is undefined (the default), behavior is unchanged.
+
+| Patch | Description |
+|-------|-------------|
+| `ggml_src_ggml-cuda_convert.cu.patch` | Guards IQ dequantization cases in `ggml_get_to_fp16_cuda` and `ggml_get_to_fp32_cuda` |
+| `ggml_src_ggml-cuda_cpy.cu.patch` | Guards the `f32 → IQ4_NL` copy helper and its dispatch case |
+| `ggml_src_ggml-cuda_mmq.cu.patch` | Guards IQ cases in `ggml_cuda_mul_mat_q_switch_type` and in the `ggml_cuda_should_use_mmq` support/heuristic switches |
+| `ggml_src_ggml-cuda_mmq.cuh.patch` | Guards the `extern DECL_MMQ_CASE(...)` declarations for IQ types |
+| `ggml_src_ggml-cuda_mmvq.cu.patch` | Guards IQ cases in `get_vec_dot_q_cuda` and `get_vdr_mmvq` |
+
+### CPU Performance Optimizations (llamafile #975)
+
+These patches restore llamafile's optimized CPU kernels (TinyBLAS matmul, AVX-512 flash-attention helpers) on top of upstream's CPU backend, and tune CPU-only defaults. The hooks call into symbols exported from `llamafile/sgemm.cpp` and are compiled only when `GGML_USE_LLAMAFILE` is defined.
+
+| Patch | Description |
+|-------|-------------|
+| `ggml_src_ggml-cpu_ggml-cpu.c.patch` | Routes MoE matmul (`ggml_compute_forward_mul_mat_id`) through `llamafile_mixmul` / `llamafile_mixmul_iqk`, mirroring the dense-matmul `llamafile_sgemm` hook; reserves work-buffer space for the MoE kernel in `ggml_graph_plan` via `llamafile_mixmul_needs` |
+| `ggml_src_ggml-cpu_ops.cpp.patch` | Routes flash-attention inner loops through llamafile's AVX-512 helpers (`llamafile_fa_vec_dot_f16`, `llamafile_fa_fp16_to_fp32_row`, `llamafile_fa_simd_gemm`) in both the one-chunk and tiled FA paths; also accumulates VKQ in f32 on CPUs lacking native f16 FMA (avoiding costly f16↔f32 round-trips per KV step) |
+| `src_llama-context.cpp.patch` | Defaults `-fa auto` to **off** on CPU-only setups (no GPU devices), since the CPU flash-attention path is slower than the non-FA path on x86; users can still force `-fa on` for memory savings on long contexts |
+
 ### Llamafile File Handling
 
 These patches integrate llamafile's file handling APIs for loading models from bundled zip archives and `.llamafile` containers.
@@ -111,7 +134,22 @@ These patches integrate llamafile's file handling APIs for loading models from b
 
 | Patch | Description |
 |-------|-------------|
-| `tools_server_server.cpp.patch` | Renames `main()` to `server_main()` with `on_ready`/`on_shutdown_available` callbacks for combined TUI+server mode; adds Metal/GPU backend trigger before `common_init()`; adds Cosmopolitan-specific standalone `main()` with `cosmo_args`, verbose flag handling, and GPU pre-initialization; handles `LLAMAFILE_TUI` exit to avoid Metal cleanup crashes |
+| `tools_server_server.cpp.patch` | Renames upstream's `llama_server()` to `server_main()` and adds `on_ready`/`on_shutdown_available` callbacks for combined TUI+server mode; adds Metal/GPU backend trigger before `common_init()`; adds Cosmopolitan-specific standalone `main()` with `cosmo_args`, verbose flag handling, and GPU pre-initialization; handles `LLAMAFILE_TUI` exit to avoid Metal cleanup crashes |
+
+The web UI moved upstream from prebuilt `tools/server/public/*` assets to
+a Svelte project under `tools/ui/`, embedded at CMake time via
+`tools/ui/embed.cpp`. cosmocc has no JS toolchain, so `apply-patches.sh`
+(run by `make setup`) downloads the prebuilt Svelte bundle from the
+`ggml-org/llama-ui` Hugging Face bucket into `llama.cpp/tools/ui/dist/`.
+At build time, `llama.cpp/BUILD.mk` compiles `tools/ui/embed.cpp` with
+`cosmoc++` (its APE output runs on the host) and runs it against the
+downloaded assets to emit `o/$(MODE)/llama.cpp/tools/ui/ui.{cpp,h}`,
+which is then compiled like any other C++ source and linked into
+`llama-server` and `llamafile`. If the download fails (offline, version
+not yet on HF) `apply-patches.sh` warns and continues with `dist/`
+empty — `embed.cpp` then emits a no-op `llama_ui_find_asset`, and
+`server-http.cpp` skips UI route registration via its
+`LLAMA_UI_HAS_ASSETS` guard so the API still works.
 
 ### Bug Fixes
 
@@ -119,6 +157,7 @@ These patches integrate llamafile's file handling APIs for loading models from b
 |-------|-------------|
 | `ggml_src_ggml-backend-reg.cpp.patch` | Suppresses debug log noise for non-existent backend search paths (irrelevant for llamafile's DSO loading approach) |
 | `ggml_src_ggml-vulkan_ggml-vulkan.cpp.patch` | Fixes unsigned integer underflow in `ggml_backend_vk_get_device_memory` where Vulkan's `heapUsage` can exceed `heapBudget` (clamps to zero instead of wrapping) |
+| `src_models_t5.cpp.patch` | Forward-declares the `graph<false>`/`graph<true>` explicit specializations before `build_arch_graph` so clang's `-std=gnu++23` doesn't reject them as specializations after implicit instantiation |
 
 ## Creating New Patches
 
